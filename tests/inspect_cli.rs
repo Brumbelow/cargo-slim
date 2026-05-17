@@ -65,6 +65,7 @@ fn inspect_reports_json_for_binary() {
 
     assert_eq!(value["path"], env!("CARGO_BIN_EXE_cargoslim"));
     assert!(value["file_size_bytes"].as_u64().unwrap() > 0);
+    assert!(value.get("file_size_mib").is_none());
 
     let object = value["object"]
         .as_object()
@@ -106,6 +107,7 @@ fn inspect_reports_unrecognized_json_file() {
 
     assert_eq!(value["path"], NOT_OBJECT_FIXTURE);
     assert!(value["file_size_bytes"].as_u64().unwrap() > 0);
+    assert!(value.get("file_size_mib").is_none());
     assert!(value["object"].is_null());
 }
 

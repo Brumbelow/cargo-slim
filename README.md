@@ -10,7 +10,7 @@ This first version intentionally starts small:
 
 - `cargoslim inspect <path>` reports file size, object format, architecture, debug-section presence, and section sizes when the file is a recognized object.
 - `cargoslim inspect --limit <n> <path>` limits section output and reports how many sections were omitted.
-- `cargoslim inspect --json <path>` emits the same report as JSON.
+- `cargoslim inspect --json <path>` emits the report as JSON, using exact byte counts for sizes.
 - `cargoslim --help` shows the available command surface.
 
 Planned work includes binary attribution, Cargo dependency and feature context, release-profile checks, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.

@@ -143,7 +143,6 @@ fn parse_section_limit(value: &str) -> Result<usize, String> {
 struct InspectReport {
     path: String,
     file_size_bytes: u64,
-    file_size_mib: f64,
     object: Option<ObjectReport>,
 }
 
@@ -183,7 +182,6 @@ fn inspect_path(path: &Path) -> Result<InspectReport, String> {
     Ok(InspectReport {
         path: path.display().to_string(),
         file_size_bytes: metadata.len(),
-        file_size_mib: bytes_to_mib(metadata.len()),
         object,
     })
 }
@@ -256,7 +254,8 @@ fn print_text_report(report: &InspectReport) {
     println!("path: {}", report.path);
     println!(
         "size: {} bytes ({:.2} MiB)",
-        report.file_size_bytes, report.file_size_mib
+        report.file_size_bytes,
+        bytes_to_mib(report.file_size_bytes)
     );
 
     let Some(object) = &report.object else {
