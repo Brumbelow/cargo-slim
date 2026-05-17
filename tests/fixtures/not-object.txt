@@ -1,0 +1,1 @@
+This is a text fixture, not an object file.
