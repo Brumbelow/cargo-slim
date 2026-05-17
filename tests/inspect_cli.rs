@@ -7,6 +7,21 @@ fn cargoslim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cargoslim"))
 }
 
+fn assert_inspect_error(args: &[&str], expected: &str) {
+    let output = cargoslim()
+        .args(args)
+        .output()
+        .expect("cargoslim should run");
+
+    assert_eq!(output.status.code(), Some(2));
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(
+        stderr.contains(expected),
+        "expected {expected:?} in stderr: {stderr}"
+    );
+}
+
 #[test]
 fn help_lists_inspect_command() {
     let output = cargoslim()
@@ -113,13 +128,76 @@ fn inspect_reports_unrecognized_json_file() {
 
 #[test]
 fn inspect_rejects_missing_limit_value() {
+    assert_inspect_error(&["inspect", "--limit"], "--limit requires a value");
+}
+
+#[test]
+fn inspect_rejects_missing_path() {
+    assert_inspect_error(&["inspect"], "inspect requires a path");
+}
+
+#[test]
+fn inspect_rejects_duplicate_paths() {
+    assert_inspect_error(
+        &[
+            "inspect",
+            NOT_OBJECT_FIXTURE,
+            env!("CARGO_BIN_EXE_cargoslim"),
+        ],
+        "inspect accepts exactly one path",
+    );
+}
+
+#[test]
+fn inspect_rejects_unknown_option() {
+    assert_inspect_error(
+        &["inspect", "--wat", NOT_OBJECT_FIXTURE],
+        "unknown inspect option",
+    );
+}
+
+#[test]
+fn inspect_rejects_bad_limit_value() {
+    assert_inspect_error(
+        &["inspect", "--limit", "many", NOT_OBJECT_FIXTURE],
+        "invalid --limit value 'many'",
+    );
+}
+
+#[test]
+fn inspect_rejects_zero_limit_value() {
+    assert_inspect_error(
+        &["inspect", "--limit=0", NOT_OBJECT_FIXTURE],
+        "--limit must be greater than zero",
+    );
+}
+
+#[test]
+fn inspect_reports_nonexistent_file_error() {
+    let missing_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/does-not-exist.bin"
+    );
     let output = cargoslim()
-        .args(["inspect", "--limit"])
+        .args(["inspect", missing_path])
         .output()
         .expect("cargoslim should run");
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.status.code(), Some(1));
 
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
-    assert!(stderr.contains("--limit requires a value"));
+    assert!(stderr.contains("could not inspect"));
+}
+
+#[test]
+fn inspect_rejects_directory_input() {
+    let output = cargoslim()
+        .args(["inspect", env!("CARGO_MANIFEST_DIR")])
+        .output()
+        .expect("cargoslim should run");
+
+    assert_eq!(output.status.code(), Some(1));
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(stderr.contains("is not a file"));
 }
