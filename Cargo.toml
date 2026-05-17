@@ -9,3 +9,8 @@ repository = "https://github.com/Brumbelow/cargo-slim"
 [[bin]]
 name = "cargoslim"
 path = "src/main.rs"
+
+[dependencies]
+object = "0.39.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
