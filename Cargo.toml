@@ -1,0 +1,11 @@
+[package]
+name = "cargo-slim"
+version = "0.1.0"
+edition = "2021"
+description = "Explain Rust binary size and produce conservative shrink plans."
+license = "MIT"
+repository = "https://github.com/Brumbelow/cargo-slim"
+
+[[bin]]
+name = "cargoslim"
+path = "src/main.rs"
