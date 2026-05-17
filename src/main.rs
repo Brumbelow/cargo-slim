@@ -19,7 +19,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Inspect(options)) => match inspect_path(&options.path) {
-            Ok(report) => {
+            Ok(mut report) => {
+                report.apply_section_limit(options.section_limit);
+
                 if options.output == OutputFormat::Json {
                     match serde_json::to_string_pretty(&report) {
                         Ok(json) => println!("{json}"),
@@ -59,6 +61,7 @@ enum Command {
 struct InspectOptions {
     path: PathBuf,
     output: OutputFormat,
+    section_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -90,12 +93,26 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut output = OutputFormat::Text;
+    let mut section_limit = None;
     let mut path = None;
+    let mut args = args.into_iter();
 
-    for arg in args {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => output = OutputFormat::Json,
+            "--limit" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--limit requires a value".to_string())?;
+                section_limit = Some(parse_section_limit(&value)?);
+            }
             "-h" | "--help" => return Ok(Command::Help),
+            _ if arg.starts_with("--limit=") => {
+                let value = arg
+                    .strip_prefix("--limit=")
+                    .expect("argument should have --limit= prefix");
+                section_limit = Some(parse_section_limit(value)?);
+            }
             _ if arg.starts_with('-') => return Err(format!("unknown inspect option '{arg}'")),
             _ if path.is_none() => path = Some(PathBuf::from(arg)),
             _ => return Err("inspect accepts exactly one path".to_string()),
@@ -103,7 +120,23 @@ where
     }
 
     let path = path.ok_or_else(|| "inspect requires a path".to_string())?;
-    Ok(Command::Inspect(InspectOptions { path, output }))
+    Ok(Command::Inspect(InspectOptions {
+        path,
+        output,
+        section_limit,
+    }))
+}
+
+fn parse_section_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --limit value '{value}'"))?;
+
+    if limit == 0 {
+        return Err("--limit must be greater than zero".to_string());
+    }
+
+    Ok(limit)
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +154,8 @@ struct ObjectReport {
     endianness: String,
     entry: u64,
     has_debug_symbols: bool,
+    total_sections: usize,
+    sections_omitted: usize,
     sections: Vec<SectionReport>,
 }
 
@@ -151,6 +186,25 @@ fn inspect_path(path: &Path) -> Result<InspectReport, String> {
         file_size_mib: bytes_to_mib(metadata.len()),
         object,
     })
+}
+
+impl InspectReport {
+    fn apply_section_limit(&mut self, limit: Option<usize>) {
+        let Some(limit) = limit else {
+            return;
+        };
+
+        let Some(object) = &mut self.object else {
+            return;
+        };
+
+        if object.sections.len() <= limit {
+            return;
+        }
+
+        object.sections_omitted = object.sections.len() - limit;
+        object.sections.truncate(limit);
+    }
 }
 
 fn read_object_report(file: object::File<'_>) -> ObjectReport {
@@ -184,6 +238,8 @@ fn read_object_report(file: object::File<'_>) -> ObjectReport {
         endianness: format!("{:?}", file.endianness()),
         entry: file.entry(),
         has_debug_symbols: has_debug_sections(&sections),
+        total_sections: sections.len(),
+        sections_omitted: 0,
         sections,
     }
 }
@@ -226,6 +282,10 @@ fn print_text_report(report: &InspectReport) {
             section.name, section.size_bytes, section.address
         );
     }
+
+    if object.sections_omitted > 0 {
+        println!("  ... {} more sections omitted", object.sections_omitted);
+    }
 }
 
 fn bytes_to_mib(bytes: u64) -> f64 {
@@ -247,12 +307,12 @@ fn print_help() {
 Explain Rust binary size and produce conservative shrink plans.
 
 Usage:
-  cargoslim inspect [--json] <path>
+  cargoslim inspect [--json] [--limit <n>] <path>
   cargoslim --help
   cargoslim --version
 
 Commands:
-  inspect [--json] <path>  Report file size and object section sizes"
+  inspect [--json] [--limit <n>] <path>  Report file size and object section sizes"
     );
 }
 
@@ -275,6 +335,7 @@ mod tests {
             Command::Inspect(InspectOptions {
                 path: PathBuf::from("target/release/app"),
                 output: OutputFormat::Text,
+                section_limit: None,
             })
         );
     }
@@ -288,8 +349,44 @@ mod tests {
             Command::Inspect(InspectOptions {
                 path: PathBuf::from("target/release/app"),
                 output: OutputFormat::Json,
+                section_limit: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_inspect_section_limit() {
+        let command = Command::parse(["inspect", "--limit", "5", "target/release/app"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::Inspect(InspectOptions {
+                path: PathBuf::from("target/release/app"),
+                output: OutputFormat::Text,
+                section_limit: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_inspect_section_limit_equals_form() {
+        let command = Command::parse(["inspect", "--limit=8", "target/release/app"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::Inspect(InspectOptions {
+                path: PathBuf::from("target/release/app"),
+                output: OutputFormat::Text,
+                section_limit: Some(8),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_section_limit() {
+        let error = Command::parse(["inspect", "--limit", "0", "target/release/app"]).unwrap_err();
+
+        assert_eq!(error, "--limit must be greater than zero");
     }
 
     #[test]
@@ -310,5 +407,6 @@ mod tests {
         assert!(!object.format.is_empty());
         assert!(!object.architecture.is_empty());
         assert!(!object.sections.is_empty());
+        assert!(object.total_sections >= object.sections.len());
     }
 }
