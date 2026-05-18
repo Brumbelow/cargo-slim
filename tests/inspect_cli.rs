@@ -55,7 +55,77 @@ fn help_lists_inspect_command() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
     assert!(stdout.contains("cargoslim"));
+    assert!(stdout.contains("diff [--json] [--limit <n>] <old> <new>"));
     assert!(stdout.contains("inspect [--json] [--limit <n>] [--manifest-path <path>] <path>"));
+}
+
+#[test]
+fn diff_reports_text_for_binaries() {
+    let test_binary = std::env::current_exe().expect("current test binary path should resolve");
+    let output = cargoslim()
+        .arg("diff")
+        .arg("--limit")
+        .arg("3")
+        .arg(&test_binary)
+        .arg(env!("CARGO_BIN_EXE_cargoslim"))
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("old:"));
+    assert!(stdout.contains("new:"));
+    assert!(stdout.contains("file size delta:"));
+    assert!(stdout.contains("section deltas:"));
+
+    let delta_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  .") && line.contains(" bytes ("))
+        .count();
+    assert!(
+        delta_lines <= 3,
+        "expected at most 3 section deltas in {stdout}"
+    );
+}
+
+#[test]
+fn diff_reports_json_for_binaries() {
+    let test_binary = std::env::current_exe().expect("current test binary path should resolve");
+    let output = cargoslim()
+        .arg("diff")
+        .arg("--json")
+        .arg("--limit=5")
+        .arg(&test_binary)
+        .arg(env!("CARGO_BIN_EXE_cargoslim"))
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+
+    assert_eq!(value["old"]["path"], test_binary.display().to_string());
+    assert_eq!(value["new"]["path"], env!("CARGO_BIN_EXE_cargoslim"));
+    assert!(value["old"]["file_size_bytes"].as_u64().unwrap() > 0);
+    assert!(value["new"]["file_size_bytes"].as_u64().unwrap() > 0);
+    assert!(value["old"]["object"].get("sections").is_none());
+    assert!(value["new"]["object"].get("sections").is_none());
+    assert!(value["file_size_delta_bytes"].is_i64());
+    assert!(
+        value["total_section_deltas"].as_u64().unwrap()
+            >= value["section_deltas"].as_array().unwrap().len() as u64
+    );
+    assert!(value["section_deltas"].as_array().unwrap().len() <= 5);
+
+    if let Some(delta) = value["section_deltas"].as_array().unwrap().first() {
+        assert!(delta["name"].as_str().unwrap().starts_with('.'));
+        assert!(delta["old_size_bytes"].is_u64());
+        assert!(delta["new_size_bytes"].is_u64());
+        assert!(delta["delta_bytes"].is_i64());
+        assert!(["added", "removed", "changed"].contains(&delta["status"].as_str().unwrap()));
+    }
 }
 
 #[test]
@@ -314,6 +384,37 @@ fn inspect_resolves_workspace_profile_context() {
 #[test]
 fn inspect_rejects_missing_limit_value() {
     assert_inspect_error(&["inspect", "--limit"], "--limit requires a value");
+}
+
+#[test]
+fn diff_rejects_missing_limit_value() {
+    assert_inspect_error(&["diff", "--limit"], "--limit requires a value");
+}
+
+#[test]
+fn diff_rejects_missing_paths() {
+    assert_inspect_error(&["diff", NOT_OBJECT_FIXTURE], "diff requires two paths");
+}
+
+#[test]
+fn diff_rejects_extra_paths() {
+    assert_inspect_error(
+        &[
+            "diff",
+            NOT_OBJECT_FIXTURE,
+            NOT_OBJECT_FIXTURE,
+            NOT_OBJECT_FIXTURE,
+        ],
+        "diff accepts exactly two paths",
+    );
+}
+
+#[test]
+fn diff_rejects_unknown_option() {
+    assert_inspect_error(
+        &["diff", "--wat", NOT_OBJECT_FIXTURE, NOT_OBJECT_FIXTURE],
+        "unknown diff option",
+    );
 }
 
 #[test]

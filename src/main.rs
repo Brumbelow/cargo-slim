@@ -20,6 +20,29 @@ fn main() -> ExitCode {
             println!("cargoslim {VERSION}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Diff(options)) => match diff_paths(&options.old_path, &options.new_path) {
+            Ok(mut report) => {
+                report.apply_section_limit(options.section_limit);
+
+                if options.output == OutputFormat::Json {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(error) => {
+                            eprintln!("error: could not serialize report: {error}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                } else {
+                    print_diff_report(&report);
+                }
+
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
         Ok(Command::Inspect(options)) => {
             match inspect_path(&options.path, options.manifest_path.as_deref()) {
                 Ok(mut report) => {
@@ -58,7 +81,16 @@ fn main() -> ExitCode {
 enum Command {
     Help,
     Version,
+    Diff(DiffOptions),
     Inspect(InspectOptions),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DiffOptions {
+    old_path: PathBuf,
+    new_path: PathBuf,
+    output: OutputFormat,
+    section_limit: Option<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -87,10 +119,56 @@ impl Command {
         match args.next().as_deref() {
             None | Some("-h") | Some("--help") => Ok(Self::Help),
             Some("-V") | Some("--version") => Ok(Self::Version),
+            Some("diff") => parse_diff(args),
             Some("inspect") => parse_inspect(args),
             Some(command) => Err(format!("unknown command '{command}'")),
         }
     }
+}
+
+fn parse_diff<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut output = OutputFormat::Text;
+    let mut section_limit = None;
+    let mut paths = Vec::new();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => output = OutputFormat::Json,
+            "--limit" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--limit requires a value".to_string())?;
+                section_limit = Some(parse_section_limit(&value)?);
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            _ if arg.starts_with("--limit=") => {
+                let value = arg
+                    .strip_prefix("--limit=")
+                    .expect("argument should have --limit= prefix");
+                section_limit = Some(parse_section_limit(value)?);
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown diff option '{arg}'")),
+            _ if paths.len() < 2 => paths.push(PathBuf::from(arg)),
+            _ => return Err("diff accepts exactly two paths".to_string()),
+        }
+    }
+
+    if paths.len() != 2 {
+        return Err("diff requires two paths".to_string());
+    }
+
+    let new_path = paths.pop().expect("new path should be present");
+    let old_path = paths.pop().expect("old path should be present");
+    Ok(Command::Diff(DiffOptions {
+        old_path,
+        new_path,
+        output,
+        section_limit,
+    }))
 }
 
 fn parse_inspect<I>(args: I) -> Result<Command, String>
@@ -159,6 +237,13 @@ fn parse_section_limit(value: &str) -> Result<usize, String> {
 }
 
 #[derive(Debug, Serialize)]
+struct BinaryReport {
+    path: String,
+    file_size_bytes: u64,
+    object: Option<ObjectReport>,
+}
+
+#[derive(Debug, Serialize)]
 struct InspectReport {
     path: String,
     file_size_bytes: u64,
@@ -184,6 +269,50 @@ struct SectionReport {
     name: String,
     address: u64,
     size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffReport {
+    old: DiffBinaryReport,
+    new: DiffBinaryReport,
+    file_size_delta_bytes: i64,
+    total_section_deltas: usize,
+    section_deltas_omitted: usize,
+    section_deltas: Vec<SectionDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffBinaryReport {
+    path: String,
+    file_size_bytes: u64,
+    object: Option<DiffObjectReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffObjectReport {
+    format: String,
+    architecture: String,
+    endianness: String,
+    entry: u64,
+    has_debug_symbols: bool,
+    total_sections: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SectionDeltaReport {
+    name: String,
+    old_size_bytes: u64,
+    new_size_bytes: u64,
+    delta_bytes: i64,
+    status: SectionDeltaStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SectionDeltaStatus {
+    Added,
+    Removed,
+    Changed,
 }
 
 #[derive(Debug, Serialize)]
@@ -291,6 +420,39 @@ struct ManifestReleaseProfile {
 }
 
 fn inspect_path(path: &Path, manifest_path: Option<&Path>) -> Result<InspectReport, String> {
+    let binary = read_binary_report(path)?;
+    let cargo = manifest_path.map(read_cargo_report).transpose()?;
+    let suggestions = build_suggestions(binary.object.as_ref(), cargo.as_ref());
+
+    Ok(InspectReport {
+        path: binary.path,
+        file_size_bytes: binary.file_size_bytes,
+        object: binary.object,
+        cargo,
+        suggestions,
+    })
+}
+
+fn diff_paths(old_path: &Path, new_path: &Path) -> Result<DiffReport, String> {
+    let old = read_binary_report(old_path)?;
+    let new = read_binary_report(new_path)?;
+    let section_deltas = diff_sections(old.object.as_ref(), new.object.as_ref());
+    let total_section_deltas = section_deltas.len();
+    let file_size_delta_bytes = byte_delta(old.file_size_bytes, new.file_size_bytes);
+    let old = DiffBinaryReport::from_binary(&old);
+    let new = DiffBinaryReport::from_binary(&new);
+
+    Ok(DiffReport {
+        old,
+        new,
+        file_size_delta_bytes,
+        total_section_deltas,
+        section_deltas_omitted: 0,
+        section_deltas,
+    })
+}
+
+fn read_binary_report(path: &Path) -> Result<BinaryReport, String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("could not inspect '{}': {error}", path.display()))?;
 
@@ -303,15 +465,11 @@ fn inspect_path(path: &Path, manifest_path: Option<&Path>) -> Result<InspectRepo
     let object = object::File::parse(bytes.as_slice())
         .ok()
         .map(read_object_report);
-    let cargo = manifest_path.map(read_cargo_report).transpose()?;
-    let suggestions = build_suggestions(object.as_ref(), cargo.as_ref());
 
-    Ok(InspectReport {
+    Ok(BinaryReport {
         path: path.display().to_string(),
         file_size_bytes: metadata.len(),
         object,
-        cargo,
-        suggestions,
     })
 }
 
@@ -803,6 +961,29 @@ impl SuggestionConfidence {
     }
 }
 
+impl DiffBinaryReport {
+    fn from_binary(binary: &BinaryReport) -> Self {
+        Self {
+            path: binary.path.clone(),
+            file_size_bytes: binary.file_size_bytes,
+            object: binary.object.as_ref().map(DiffObjectReport::from_object),
+        }
+    }
+}
+
+impl DiffObjectReport {
+    fn from_object(object: &ObjectReport) -> Self {
+        Self {
+            format: object.format.clone(),
+            architecture: object.architecture.clone(),
+            endianness: object.endianness.clone(),
+            entry: object.entry,
+            has_debug_symbols: object.has_debug_symbols,
+            total_sections: object.total_sections,
+        }
+    }
+}
+
 impl InspectReport {
     fn apply_section_limit(&mut self, limit: Option<usize>) {
         let Some(limit) = limit else {
@@ -819,6 +1000,90 @@ impl InspectReport {
 
         object.sections_omitted = object.sections.len() - limit;
         object.sections.truncate(limit);
+    }
+}
+
+impl DiffReport {
+    fn apply_section_limit(&mut self, limit: Option<usize>) {
+        let Some(limit) = limit else {
+            return;
+        };
+
+        if self.section_deltas.len() <= limit {
+            return;
+        }
+
+        self.section_deltas_omitted = self.section_deltas.len() - limit;
+        self.section_deltas.truncate(limit);
+    }
+}
+
+fn diff_sections(
+    old_object: Option<&ObjectReport>,
+    new_object: Option<&ObjectReport>,
+) -> Vec<SectionDeltaReport> {
+    let old_sections = aggregate_section_sizes(old_object);
+    let new_sections = aggregate_section_sizes(new_object);
+    let names = old_sections
+        .keys()
+        .chain(new_sections.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut deltas = names
+        .into_iter()
+        .filter_map(|name| {
+            let old_size = old_sections.get(&name).copied().unwrap_or(0);
+            let new_size = new_sections.get(&name).copied().unwrap_or(0);
+
+            if old_size == new_size {
+                return None;
+            }
+
+            let status = match (old_size, new_size) {
+                (0, _) => SectionDeltaStatus::Added,
+                (_, 0) => SectionDeltaStatus::Removed,
+                _ => SectionDeltaStatus::Changed,
+            };
+
+            Some(SectionDeltaReport {
+                name,
+                old_size_bytes: old_size,
+                new_size_bytes: new_size,
+                delta_bytes: byte_delta(old_size, new_size),
+                status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    deltas.sort_by(|left, right| {
+        right
+            .delta_bytes
+            .unsigned_abs()
+            .cmp(&left.delta_bytes.unsigned_abs())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    deltas
+}
+
+fn aggregate_section_sizes(object: Option<&ObjectReport>) -> BTreeMap<String, u64> {
+    let mut sections = BTreeMap::<String, u64>::new();
+
+    if let Some(object) = object {
+        for section in &object.sections {
+            let total = sections.entry(section.name.clone()).or_default();
+            *total = total.saturating_add(section.size_bytes);
+        }
+    }
+
+    sections
+}
+
+fn byte_delta(old: u64, new: u64) -> i64 {
+    if new >= old {
+        (new - old).min(i64::MAX as u64) as i64
+    } else {
+        -((old - new).min(i64::MAX as u64) as i64)
     }
 }
 
@@ -865,6 +1130,64 @@ fn has_debug_sections(sections: &[SectionReport]) -> bool {
             || section.name.starts_with("__debug_")
             || section.name == ".zdebug"
     })
+}
+
+fn print_diff_report(report: &DiffReport) {
+    print_binary_summary("old", &report.old);
+    print_binary_summary("new", &report.new);
+    println!(
+        "file size delta: {:+} bytes ({:+.2} MiB)",
+        report.file_size_delta_bytes,
+        signed_bytes_to_mib(report.file_size_delta_bytes)
+    );
+
+    if report.section_deltas.is_empty() {
+        if report.old.object.is_some() || report.new.object.is_some() {
+            println!("section deltas: none");
+        } else {
+            println!("section deltas: unavailable (neither input is a recognized object)");
+        }
+        return;
+    }
+
+    println!("section deltas:");
+    for delta in &report.section_deltas {
+        println!(
+            "  {}: {:+} bytes ({} -> {}, {})",
+            delta.name,
+            delta.delta_bytes,
+            delta.old_size_bytes,
+            delta.new_size_bytes,
+            delta.status.as_str()
+        );
+    }
+
+    if report.section_deltas_omitted > 0 {
+        println!(
+            "  ... {} more section deltas omitted",
+            report.section_deltas_omitted
+        );
+    }
+}
+
+fn print_binary_summary(label: &str, binary: &DiffBinaryReport) {
+    println!("{label}: {}", binary.path);
+    println!(
+        "  size: {} bytes ({:.2} MiB)",
+        binary.file_size_bytes,
+        bytes_to_mib(binary.file_size_bytes)
+    );
+
+    match &binary.object {
+        Some(object) => {
+            println!(
+                "  object: {} {} {}",
+                object.format, object.architecture, object.endianness
+            );
+            println!("  sections: {}", object.total_sections);
+        }
+        None => println!("  object: not recognized"),
+    }
 }
 
 fn print_text_report(report: &InspectReport) {
@@ -982,11 +1305,25 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
 }
 
+fn signed_bytes_to_mib(bytes: i64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value {
         "yes"
     } else {
         "no"
+    }
+}
+
+impl SectionDeltaStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Changed => "changed",
+        }
     }
 }
 
@@ -997,11 +1334,14 @@ fn print_help() {
 Explain Rust binary size and produce conservative shrink plans.
 
 Usage:
+  cargoslim diff [--json] [--limit <n>] <old> <new>
   cargoslim inspect [--json] [--limit <n>] [--manifest-path <path>] <path>
   cargoslim --help
   cargoslim --version
 
 Commands:
+  diff [--json] [--limit <n>] <old> <new>
+    Compare file size and object section sizes between two binaries
   inspect [--json] [--limit <n>] [--manifest-path <path>] <path>
     Report file size, object section sizes, Cargo context, and conservative suggestions"
     );
@@ -1009,12 +1349,21 @@ Commands:
 
 #[cfg(test)]
 mod tests {
-    use super::{bytes_to_mib, inspect_path, Command, InspectOptions, OutputFormat};
+    use super::{
+        byte_delta, bytes_to_mib, inspect_path, Command, DiffOptions, InspectOptions, OutputFormat,
+    };
     use std::path::PathBuf;
 
     #[test]
     fn converts_bytes_to_mib() {
         assert_eq!(bytes_to_mib(1_048_576), 1.0);
+    }
+
+    #[test]
+    fn calculates_signed_byte_delta() {
+        assert_eq!(byte_delta(10, 15), 5);
+        assert_eq!(byte_delta(15, 10), -5);
+        assert_eq!(byte_delta(10, 10), 0);
     }
 
     #[test]
@@ -1028,6 +1377,36 @@ mod tests {
                 manifest_path: None,
                 output: OutputFormat::Text,
                 section_limit: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_diff_defaults_to_text() {
+        let command = Command::parse(["diff", "old", "new"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::Diff(DiffOptions {
+                old_path: PathBuf::from("old"),
+                new_path: PathBuf::from("new"),
+                output: OutputFormat::Text,
+                section_limit: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_diff_json_and_section_limit() {
+        let command = Command::parse(["diff", "--json", "--limit=4", "old", "new"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::Diff(DiffOptions {
+                old_path: PathBuf::from("old"),
+                new_path: PathBuf::from("new"),
+                output: OutputFormat::Json,
+                section_limit: Some(4),
             })
         );
     }
@@ -1137,6 +1516,20 @@ mod tests {
         let error = Command::parse(["inspect", "a", "b"]).unwrap_err();
 
         assert_eq!(error, "inspect accepts exactly one path");
+    }
+
+    #[test]
+    fn rejects_missing_diff_paths() {
+        let error = Command::parse(["diff", "old"]).unwrap_err();
+
+        assert_eq!(error, "diff requires two paths");
+    }
+
+    #[test]
+    fn rejects_extra_diff_paths() {
+        let error = Command::parse(["diff", "old", "new", "extra"]).unwrap_err();
+
+        assert_eq!(error, "diff accepts exactly two paths");
     }
 
     #[test]

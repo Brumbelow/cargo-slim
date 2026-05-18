@@ -12,9 +12,11 @@ This first version intentionally starts small:
 - `cargoslim inspect --limit <n> <path>` limits section output and reports how many sections were omitted.
 - `cargoslim inspect --manifest-path Cargo.toml <path>` adds Cargo package, workspace, lockfile, direct dependency, explicit release-profile facts, and conservative suggestions.
 - `cargoslim inspect --json <path>` emits the report as JSON, using exact byte counts for sizes.
+- `cargoslim diff <old> <new>` compares file size and object section sizes between two binaries.
+- `cargoslim diff --json --limit <n> <old> <new>` emits exact byte deltas and the largest section deltas as JSON.
 - `cargoslim --help` shows the available command surface.
 
-Current suggestions are intentionally narrow. They come from concrete release-profile settings, duplicate package versions in `Cargo.lock`, and direct dependency declarations where default-feature behavior is visible. Planned work includes binary attribution, deeper Cargo dependency and feature context, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.
+Current suggestions are intentionally narrow. They come from concrete release-profile settings, duplicate package versions in `Cargo.lock`, and direct dependency declarations where default-feature behavior is visible. Planned work includes binary attribution and deeper Cargo dependency and feature context. The goal is to explain size with evidence before suggesting changes.
 
 ## Install from source
 
@@ -38,6 +40,12 @@ Include Cargo project context when inspecting a binary:
 
 ```sh
 cargoslim inspect --manifest-path Cargo.toml target/release/my-binary
+```
+
+Compare two binaries:
+
+```sh
+cargoslim diff target/release/my-binary.old target/release/my-binary
 ```
 
 Example output:
@@ -83,6 +91,7 @@ For scripts and snapshot tests:
 
 ```sh
 cargoslim inspect --json --limit 10 target/release/my-binary
+cargoslim diff --json --limit 10 target/release/my-binary.old target/release/my-binary
 ```
 
 ## Status
