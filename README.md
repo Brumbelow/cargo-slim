@@ -10,10 +10,11 @@ This first version intentionally starts small:
 
 - `cargoslim inspect <path>` reports file size, object format, architecture, debug-section presence, and section sizes when the file is a recognized object.
 - `cargoslim inspect --limit <n> <path>` limits section output and reports how many sections were omitted.
+- `cargoslim inspect --manifest-path Cargo.toml <path>` adds Cargo package, workspace, lockfile, and explicit release-profile facts.
 - `cargoslim inspect --json <path>` emits the report as JSON, using exact byte counts for sizes.
 - `cargoslim --help` shows the available command surface.
 
-Planned work includes binary attribution, Cargo dependency and feature context, release-profile checks, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.
+Planned work includes binary attribution, deeper Cargo dependency and feature context, conservative suggestions, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.
 
 ## Install from source
 
@@ -33,6 +34,12 @@ Limit section output when a binary has many sections:
 cargoslim inspect --limit 10 target/release/my-binary
 ```
 
+Include Cargo project context when inspecting a binary:
+
+```sh
+cargoslim inspect --manifest-path Cargo.toml target/release/my-binary
+```
+
 Example output:
 
 ```text
@@ -46,6 +53,19 @@ debug symbols: no
 sections:
   .text: 383104 bytes at 0x7b20
   .rodata: 65440 bytes at 0x65fa0
+cargo:
+  manifest: /path/to/project/Cargo.toml
+  package root: /path/to/project
+  workspace root: /path/to/project
+  package: my-binary 0.1.0 (edition 2021)
+  lockfile: /path/to/project/Cargo.lock (32 packages)
+  release profile: /path/to/project/Cargo.toml
+    strip: symbols
+    debug: false
+    lto: thin
+    codegen-units: 1
+    panic: abort
+    opt-level: z
 ```
 
 For scripts and snapshot tests:

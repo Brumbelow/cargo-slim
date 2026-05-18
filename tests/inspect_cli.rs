@@ -2,6 +2,14 @@ use std::process::Command;
 
 const NOT_OBJECT_FIXTURE: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/not-object.txt");
+const CARGO_PROJECT_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/cargo-project/Cargo.toml"
+);
+const WORKSPACE_MEMBER_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workspace/member/Cargo.toml"
+);
 
 fn cargoslim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cargoslim"))
@@ -33,7 +41,7 @@ fn help_lists_inspect_command() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
     assert!(stdout.contains("cargoslim"));
-    assert!(stdout.contains("inspect [--json] [--limit <n>] <path>"));
+    assert!(stdout.contains("inspect [--json] [--limit <n>] [--manifest-path <path>] <path>"));
 }
 
 #[test]
@@ -127,8 +135,113 @@ fn inspect_reports_unrecognized_json_file() {
 }
 
 #[test]
+fn inspect_reports_cargo_context_text() {
+    let output = cargoslim()
+        .args([
+            "inspect",
+            "--manifest-path",
+            CARGO_PROJECT_MANIFEST,
+            NOT_OBJECT_FIXTURE,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("object: not recognized"));
+    assert!(stdout.contains("cargo:"));
+    assert!(stdout.contains("package: fixture-app 0.1.0 (edition 2021)"));
+    assert!(stdout.contains("lockfile:"));
+    assert!(stdout.contains("(2 packages)"));
+    assert!(stdout.contains("opt-level: z"));
+    assert!(stdout.contains("debug: false"));
+    assert!(stdout.contains("lto: thin"));
+    assert!(stdout.contains("codegen-units: 1"));
+    assert!(stdout.contains("panic: abort"));
+    assert!(stdout.contains("strip: symbols"));
+}
+
+#[test]
+fn inspect_reports_cargo_context_json() {
+    let output = cargoslim()
+        .args([
+            "inspect",
+            "--json",
+            "--manifest-path",
+            CARGO_PROJECT_MANIFEST,
+            NOT_OBJECT_FIXTURE,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+    let cargo = value["cargo"].as_object().expect("cargo should be present");
+
+    assert_eq!(cargo["package"]["name"], "fixture-app");
+    assert_eq!(cargo["package"]["version"], "0.1.0");
+    assert_eq!(cargo["package"]["edition"], "2021");
+    assert_eq!(cargo["release_profile"]["opt_level"], "z");
+    assert_eq!(cargo["release_profile"]["debug"], false);
+    assert_eq!(cargo["release_profile"]["lto"], "thin");
+    assert_eq!(cargo["release_profile"]["codegen_units"], 1);
+    assert_eq!(cargo["release_profile"]["panic"], "abort");
+    assert_eq!(cargo["release_profile"]["strip"], "symbols");
+    assert_eq!(cargo["lockfile"]["package_count"], 2);
+    assert_eq!(cargo["lockfile"]["packages"][0]["name"], "fixture-app");
+    assert_eq!(cargo["lockfile"]["packages"][1]["name"], "serde");
+}
+
+#[test]
+fn inspect_resolves_workspace_profile_context() {
+    let output = cargoslim()
+        .args([
+            "inspect",
+            "--json",
+            "--manifest-path",
+            WORKSPACE_MEMBER_MANIFEST,
+            NOT_OBJECT_FIXTURE,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+    let cargo = value["cargo"].as_object().expect("cargo should be present");
+    let package_root = cargo["package_root"].as_str().unwrap();
+    let workspace_root = cargo["workspace_root"].as_str().unwrap();
+    let profile_manifest_path = cargo["release_profile"]["profile_manifest_path"]
+        .as_str()
+        .unwrap();
+
+    assert!(package_root.ends_with("/tests/fixtures/workspace/member"));
+    assert!(workspace_root.ends_with("/tests/fixtures/workspace"));
+    assert!(profile_manifest_path.ends_with("/tests/fixtures/workspace/Cargo.toml"));
+    assert_eq!(cargo["package"]["name"], "workspace-member");
+    assert_eq!(cargo["release_profile"]["opt_level"], 3);
+    assert_eq!(cargo["release_profile"]["debug"], 1);
+    assert_eq!(cargo["release_profile"]["lto"], false);
+    assert_eq!(cargo["release_profile"]["codegen_units"], 8);
+    assert_eq!(cargo["release_profile"]["strip"], true);
+    assert_eq!(cargo["lockfile"]["package_count"], 1);
+}
+
+#[test]
 fn inspect_rejects_missing_limit_value() {
     assert_inspect_error(&["inspect", "--limit"], "--limit requires a value");
+}
+
+#[test]
+fn inspect_rejects_missing_manifest_path_value() {
+    assert_inspect_error(
+        &["inspect", "--manifest-path"],
+        "--manifest-path requires a value",
+    );
 }
 
 #[test]

@@ -1,0 +1,12 @@
+[package]
+name = "fixture-app"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+strip = "symbols"
+debug = false
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"

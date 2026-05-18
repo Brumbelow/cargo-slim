@@ -1,0 +1,11 @@
+[workspace]
+members = ["member"]
+resolver = "2"
+
+[profile.release]
+strip = true
+debug = 1
+lto = false
+codegen-units = 8
+panic = "abort"
+opt-level = 3
