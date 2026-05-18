@@ -1,0 +1,17 @@
+[package]
+name = "suggestion-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+regex = { version = "1.12.2", features = ["std"] }
+serde = "1.0.228"
+smallvec = { version = "1.15.1", default-features = false }
+
+[profile.release]
+strip = false
+debug = true
+lto = false
+codegen-units = 16
+panic = "unwind"
+opt-level = 3

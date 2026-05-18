@@ -10,6 +10,10 @@ const WORKSPACE_MEMBER_MANIFEST: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/workspace/member/Cargo.toml"
 );
+const SUGGESTIONS_MANIFEST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/suggestions/Cargo.toml"
+);
 
 fn cargoslim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cargoslim"))
@@ -28,6 +32,16 @@ fn assert_inspect_error(args: &[&str], expected: &str) {
         stderr.contains(expected),
         "expected {expected:?} in stderr: {stderr}"
     );
+}
+
+fn suggestion_with_title<'a>(
+    suggestions: &'a [serde_json::Value],
+    title: &str,
+) -> &'a serde_json::Value {
+    suggestions
+        .iter()
+        .find(|suggestion| suggestion["title"] == title)
+        .unwrap_or_else(|| panic!("missing suggestion {title:?} in {suggestions:#?}"))
 }
 
 #[test]
@@ -193,6 +207,72 @@ fn inspect_reports_cargo_context_json() {
     assert_eq!(cargo["lockfile"]["package_count"], 2);
     assert_eq!(cargo["lockfile"]["packages"][0]["name"], "fixture-app");
     assert_eq!(cargo["lockfile"]["packages"][1]["name"], "serde");
+    assert!(value["suggestions"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn inspect_reports_conservative_suggestions_text() {
+    let output = cargoslim()
+        .args([
+            "inspect",
+            "--manifest-path",
+            SUGGESTIONS_MANIFEST,
+            NOT_OBJECT_FIXTURE,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("suggestions:"));
+    assert!(stdout.contains("Remove release debug information"));
+    assert!(stdout.contains("Strip symbols from release binaries"));
+    assert!(stdout.contains("Review duplicate dependency versions"));
+    assert!(stdout.contains("Audit direct dependency default features"));
+    assert!(stdout.contains("confidence: high"));
+    assert!(stdout.contains("Cargo.lock contains multiple versions for: duplicate (1.0.0, 2.0.0)."));
+}
+
+#[test]
+fn inspect_reports_conservative_suggestions_json() {
+    let output = cargoslim()
+        .args([
+            "inspect",
+            "--json",
+            "--manifest-path",
+            SUGGESTIONS_MANIFEST,
+            NOT_OBJECT_FIXTURE,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+    let suggestions = value["suggestions"]
+        .as_array()
+        .expect("suggestions should be an array");
+
+    let debug = suggestion_with_title(suggestions, "Remove release debug information");
+    assert_eq!(debug["confidence"], "high");
+    assert_eq!(debug["evidence"], "[profile.release].debug is true.");
+
+    let duplicates = suggestion_with_title(suggestions, "Review duplicate dependency versions");
+    assert_eq!(duplicates["confidence"], "high");
+    assert!(duplicates["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("duplicate (1.0.0, 2.0.0)"));
+
+    let default_features =
+        suggestion_with_title(suggestions, "Audit direct dependency default features");
+    assert_eq!(default_features["confidence"], "low");
+    assert_eq!(
+        default_features["evidence"],
+        "Direct dependencies with default features enabled or unspecified: regex, serde."
+    );
 }
 
 #[test]

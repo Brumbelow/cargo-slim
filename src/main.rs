@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -163,6 +164,7 @@ struct InspectReport {
     file_size_bytes: u64,
     object: Option<ObjectReport>,
     cargo: Option<CargoReport>,
+    suggestions: Vec<SuggestionReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +194,7 @@ struct CargoReport {
     package: Option<PackageReport>,
     release_profile: ReleaseProfileReport,
     lockfile: Option<LockfileReport>,
+    direct_dependencies: Vec<ManifestDependencyReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,10 +237,34 @@ struct LockfilePackageReport {
     source: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ManifestDependencyReport {
+    name: String,
+    default_features: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SuggestionReport {
+    title: String,
+    confidence: SuggestionConfidence,
+    evidence: String,
+    tradeoff: String,
+    action: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SuggestionConfidence {
+    High,
+    Medium,
+    Low,
+}
+
 #[derive(Debug, Deserialize)]
 struct CargoManifest {
     package: Option<ManifestPackage>,
     profile: Option<ManifestProfiles>,
+    dependencies: Option<BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,12 +304,14 @@ fn inspect_path(path: &Path, manifest_path: Option<&Path>) -> Result<InspectRepo
         .ok()
         .map(read_object_report);
     let cargo = manifest_path.map(read_cargo_report).transpose()?;
+    let suggestions = build_suggestions(object.as_ref(), cargo.as_ref());
 
     Ok(InspectReport {
         path: path.display().to_string(),
         file_size_bytes: metadata.len(),
         object,
         cargo,
+        suggestions,
     })
 }
 
@@ -316,6 +345,7 @@ fn read_cargo_report(manifest_path: &Path) -> Result<CargoReport, String> {
         manifest_path: manifest_path.display().to_string(),
         package_root: package_root.display().to_string(),
         workspace_root: workspace_root.display().to_string(),
+        direct_dependencies: read_direct_dependencies(&package_manifest),
         package: package_manifest.package.map(PackageReport::from),
         release_profile,
         lockfile,
@@ -407,6 +437,17 @@ fn read_lockfile_report(workspace_root: &Path) -> Result<Option<LockfileReport>,
     }))
 }
 
+fn read_direct_dependencies(manifest: &CargoManifest) -> Vec<ManifestDependencyReport> {
+    let Some(dependencies) = &manifest.dependencies else {
+        return Vec::new();
+    };
+
+    dependencies
+        .iter()
+        .filter_map(|(name, value)| ManifestDependencyReport::from_toml(name, value))
+        .collect()
+}
+
 impl From<ManifestPackage> for PackageReport {
     fn from(package: ManifestPackage) -> Self {
         Self {
@@ -488,6 +529,280 @@ impl LockfilePackageReport {
     }
 }
 
+impl ManifestDependencyReport {
+    fn from_toml(name: &str, value: &toml::Value) -> Option<Self> {
+        let default_features = match value {
+            toml::Value::String(_) => true,
+            toml::Value::Table(table) => {
+                if table
+                    .get("workspace")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+
+                table
+                    .get("default-features")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true)
+            }
+            _ => return None,
+        };
+
+        Some(Self {
+            name: name.to_string(),
+            default_features,
+        })
+    }
+}
+
+fn build_suggestions(
+    object: Option<&ObjectReport>,
+    cargo: Option<&CargoReport>,
+) -> Vec<SuggestionReport> {
+    let Some(cargo) = cargo else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    add_profile_suggestions(&mut suggestions, object, &cargo.release_profile);
+    add_duplicate_dependency_suggestions(&mut suggestions, cargo.lockfile.as_ref());
+    add_default_feature_suggestions(&mut suggestions, &cargo.direct_dependencies);
+    suggestions.sort_by_key(|suggestion| suggestion.confidence.rank());
+    suggestions
+}
+
+fn add_profile_suggestions(
+    suggestions: &mut Vec<SuggestionReport>,
+    object: Option<&ObjectReport>,
+    profile: &ReleaseProfileReport,
+) {
+    let has_debug_sections = object
+        .map(|object| object.has_debug_symbols)
+        .unwrap_or(false);
+    let debug_enabled = profile
+        .debug
+        .as_ref()
+        .map(profile_value_enabled)
+        .unwrap_or(false);
+
+    if has_debug_sections || debug_enabled {
+        suggestions.push(SuggestionReport {
+            title: "Remove release debug information".to_string(),
+            confidence: SuggestionConfidence::High,
+            evidence: match (has_debug_sections, &profile.debug) {
+                (true, Some(value)) => format!(
+                    "The inspected object has debug sections and [profile.release].debug is {value}."
+                ),
+                (true, None) => "The inspected object has debug sections.".to_string(),
+                (false, Some(value)) => format!("[profile.release].debug is {value}."),
+                (false, None) => unreachable!("debug evidence requires profile or object evidence"),
+            },
+            tradeoff: "Disabling debug info reduces symbol detail in release artifacts; keep separate debuginfo if production debugging needs it.".to_string(),
+            action: "Set [profile.release] debug = false for size-focused release builds and compare the binary.".to_string(),
+        });
+    }
+
+    if profile
+        .strip
+        .as_ref()
+        .map(profile_value_disabled)
+        .unwrap_or(true)
+    {
+        suggestions.push(SuggestionReport {
+            title: "Strip symbols from release binaries".to_string(),
+            confidence: SuggestionConfidence::Medium,
+            evidence: profile_setting_evidence("strip", profile.strip.as_ref(), "is not set"),
+            tradeoff: "Stripping symbols makes ad hoc debugging harder unless symbols are preserved separately.".to_string(),
+            action: "Set [profile.release] strip = \"symbols\" or strip = true, then inspect the resulting binary.".to_string(),
+        });
+    }
+
+    if profile
+        .lto
+        .as_ref()
+        .map(profile_value_disabled)
+        .unwrap_or(true)
+    {
+        suggestions.push(SuggestionReport {
+            title: "Compare release builds with LTO enabled".to_string(),
+            confidence: SuggestionConfidence::Medium,
+            evidence: profile_setting_evidence("lto", profile.lto.as_ref(), "is not set"),
+            tradeoff: "LTO often increases release build time and can change optimization behavior, so measure the result.".to_string(),
+            action: "Try [profile.release] lto = \"thin\" first, then compare size and runtime behavior.".to_string(),
+        });
+    }
+
+    if profile.codegen_units.map(|value| value > 1).unwrap_or(true) {
+        suggestions.push(SuggestionReport {
+            title: "Compare codegen-units = 1".to_string(),
+            confidence: SuggestionConfidence::Medium,
+            evidence: match profile.codegen_units {
+                Some(value) => format!("[profile.release].codegen-units is {value}."),
+                None => "[profile.release].codegen-units is not set.".to_string(),
+            },
+            tradeoff: "A single codegen unit usually slows release builds because it gives LLVM less parallelism.".to_string(),
+            action: "Set [profile.release] codegen-units = 1 for a size-focused build and compare the output.".to_string(),
+        });
+    }
+
+    if profile
+        .panic
+        .as_deref()
+        .map(|value| value != "abort")
+        .unwrap_or(true)
+    {
+        suggestions.push(SuggestionReport {
+            title: "Evaluate panic = \"abort\"".to_string(),
+            confidence: SuggestionConfidence::Medium,
+            evidence: match &profile.panic {
+                Some(value) => format!("[profile.release].panic is {value}."),
+                None => "[profile.release].panic is not set.".to_string(),
+            },
+            tradeoff: "Abort-on-panic removes unwinding but is not appropriate when code relies on catching panics across unwind boundaries.".to_string(),
+            action: "Set [profile.release] panic = \"abort\" only if aborting on panic fits the application.".to_string(),
+        });
+    }
+
+    if profile
+        .opt_level
+        .as_ref()
+        .map(opt_level_favors_speed)
+        .unwrap_or(true)
+    {
+        suggestions.push(SuggestionReport {
+            title: "Compare a size-focused opt-level".to_string(),
+            confidence: SuggestionConfidence::Low,
+            evidence: profile_setting_evidence("opt-level", profile.opt_level.as_ref(), "is not set"),
+            tradeoff: "Size-focused optimization can reduce throughput or change latency-sensitive code paths.".to_string(),
+            action: "Compare [profile.release] opt-level = \"z\" or \"s\" against the current release build before keeping it.".to_string(),
+        });
+    }
+}
+
+fn add_duplicate_dependency_suggestions(
+    suggestions: &mut Vec<SuggestionReport>,
+    lockfile: Option<&LockfileReport>,
+) {
+    let Some(lockfile) = lockfile else {
+        return;
+    };
+
+    let mut versions_by_name = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for package in &lockfile.packages {
+        versions_by_name
+            .entry(&package.name)
+            .or_default()
+            .insert(&package.version);
+    }
+
+    let duplicates = versions_by_name
+        .into_iter()
+        .filter(|(_, versions)| versions.len() > 1)
+        .map(|(name, versions)| {
+            let versions = versions.into_iter().collect::<Vec<_>>().join(", ");
+            format!("{name} ({versions})")
+        })
+        .collect::<Vec<_>>();
+
+    if duplicates.is_empty() {
+        return;
+    }
+
+    suggestions.push(SuggestionReport {
+        title: "Review duplicate dependency versions".to_string(),
+        confidence: SuggestionConfidence::High,
+        evidence: format!(
+            "Cargo.lock contains multiple versions for: {}.",
+            duplicates.join("; ")
+        ),
+        tradeoff: "Aligning versions can require dependency upgrades and compatibility review.".to_string(),
+        action: "Use cargo tree -d, then update or constrain dependencies so Cargo can resolve fewer duplicate versions.".to_string(),
+    });
+}
+
+fn add_default_feature_suggestions(
+    suggestions: &mut Vec<SuggestionReport>,
+    dependencies: &[ManifestDependencyReport],
+) {
+    let dependencies_with_defaults = dependencies
+        .iter()
+        .filter(|dependency| dependency.default_features)
+        .map(|dependency| dependency.name.as_str())
+        .collect::<Vec<_>>();
+
+    if dependencies_with_defaults.is_empty() {
+        return;
+    }
+
+    suggestions.push(SuggestionReport {
+        title: "Audit direct dependency default features".to_string(),
+        confidence: SuggestionConfidence::Low,
+        evidence: format!(
+            "Direct dependencies with default features enabled or unspecified: {}.",
+            dependencies_with_defaults.join(", ")
+        ),
+        tradeoff: "Disabling default features can remove APIs, protocol support, or platform behavior that the application needs.".to_string(),
+        action: "For dependencies whose defaults are unnecessary, set default-features = false and list the needed features explicitly.".to_string(),
+    });
+}
+
+fn profile_value_enabled(value: &ProfileValue) -> bool {
+    match value {
+        ProfileValue::Bool(value) => *value,
+        ProfileValue::Integer(value) => *value > 0,
+        ProfileValue::String(value) => value != "false" && value != "0" && value != "none",
+    }
+}
+
+fn profile_value_disabled(value: &ProfileValue) -> bool {
+    match value {
+        ProfileValue::Bool(value) => !*value,
+        ProfileValue::Integer(value) => *value == 0,
+        ProfileValue::String(value) => value == "false" || value == "0" || value == "none",
+    }
+}
+
+fn opt_level_favors_speed(value: &ProfileValue) -> bool {
+    match value {
+        ProfileValue::Integer(value) => *value >= 2,
+        ProfileValue::String(value) => value == "2" || value == "3",
+        ProfileValue::Bool(_) => false,
+    }
+}
+
+fn profile_setting_evidence(
+    key: &str,
+    value: Option<&ProfileValue>,
+    missing_text: &'static str,
+) -> String {
+    match value {
+        Some(value) => format!("[profile.release].{key} is {value}."),
+        None => format!("[profile.release].{key} {missing_text}."),
+    }
+}
+
+impl fmt::Display for SuggestionConfidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::High => write!(formatter, "high"),
+            Self::Medium => write!(formatter, "medium"),
+            Self::Low => write!(formatter, "low"),
+        }
+    }
+}
+
+impl SuggestionConfidence {
+    fn rank(self) -> u8 {
+        match self {
+            Self::High => 0,
+            Self::Medium => 1,
+            Self::Low => 2,
+        }
+    }
+}
+
 impl InspectReport {
     fn apply_section_limit(&mut self, limit: Option<usize>) {
         let Some(limit) = limit else {
@@ -560,39 +875,37 @@ fn print_text_report(report: &InspectReport) {
         bytes_to_mib(report.file_size_bytes)
     );
 
-    let Some(object) = &report.object else {
-        println!("object: not recognized");
-        if let Some(cargo) = &report.cargo {
-            print_cargo_report(cargo);
+    if let Some(object) = &report.object {
+        println!("object: {}", object.format);
+        println!("architecture: {}", object.architecture);
+        println!("endianness: {}", object.endianness);
+        println!("entry: 0x{:x}", object.entry);
+        println!("debug symbols: {}", yes_no(object.has_debug_symbols));
+
+        if object.sections.is_empty() {
+            println!("sections: none reported");
+        } else {
+            println!("sections:");
+            for section in &object.sections {
+                println!(
+                    "  {}: {} bytes at 0x{:x}",
+                    section.name, section.size_bytes, section.address
+                );
+            }
+
+            if object.sections_omitted > 0 {
+                println!("  ... {} more sections omitted", object.sections_omitted);
+            }
         }
-        return;
-    };
-
-    println!("object: {}", object.format);
-    println!("architecture: {}", object.architecture);
-    println!("endianness: {}", object.endianness);
-    println!("entry: 0x{:x}", object.entry);
-    println!("debug symbols: {}", yes_no(object.has_debug_symbols));
-
-    if object.sections.is_empty() {
-        println!("sections: none reported");
     } else {
-        println!("sections:");
-        for section in &object.sections {
-            println!(
-                "  {}: {} bytes at 0x{:x}",
-                section.name, section.size_bytes, section.address
-            );
-        }
-
-        if object.sections_omitted > 0 {
-            println!("  ... {} more sections omitted", object.sections_omitted);
-        }
+        println!("object: not recognized");
     }
 
     if let Some(cargo) = &report.cargo {
         print_cargo_report(cargo);
     }
+
+    print_suggestions(&report.suggestions);
 }
 
 fn print_cargo_report(cargo: &CargoReport) {
@@ -650,6 +963,21 @@ fn print_release_profile(profile: &ReleaseProfileReport) {
     }
 }
 
+fn print_suggestions(suggestions: &[SuggestionReport]) {
+    if suggestions.is_empty() {
+        return;
+    }
+
+    println!("suggestions:");
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        println!("  {}. {}", index + 1, suggestion.title);
+        println!("     confidence: {}", suggestion.confidence);
+        println!("     evidence: {}", suggestion.evidence);
+        println!("     tradeoff: {}", suggestion.tradeoff);
+        println!("     action: {}", suggestion.action);
+    }
+}
+
 fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
 }
@@ -675,7 +1003,7 @@ Usage:
 
 Commands:
   inspect [--json] [--limit <n>] [--manifest-path <path>] <path>
-    Report file size, object section sizes, and optional Cargo context"
+    Report file size, object section sizes, Cargo context, and conservative suggestions"
     );
 }
 

@@ -10,11 +10,11 @@ This first version intentionally starts small:
 
 - `cargoslim inspect <path>` reports file size, object format, architecture, debug-section presence, and section sizes when the file is a recognized object.
 - `cargoslim inspect --limit <n> <path>` limits section output and reports how many sections were omitted.
-- `cargoslim inspect --manifest-path Cargo.toml <path>` adds Cargo package, workspace, lockfile, and explicit release-profile facts.
+- `cargoslim inspect --manifest-path Cargo.toml <path>` adds Cargo package, workspace, lockfile, direct dependency, explicit release-profile facts, and conservative suggestions.
 - `cargoslim inspect --json <path>` emits the report as JSON, using exact byte counts for sizes.
 - `cargoslim --help` shows the available command surface.
 
-Planned work includes binary attribution, deeper Cargo dependency and feature context, conservative suggestions, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.
+Current suggestions are intentionally narrow. They come from concrete release-profile settings, duplicate package versions in `Cargo.lock`, and direct dependency declarations where default-feature behavior is visible. Planned work includes binary attribution, deeper Cargo dependency and feature context, and diff-based reporting. The goal is to explain size with evidence before suggesting changes.
 
 ## Install from source
 
@@ -68,6 +68,17 @@ cargo:
     opt-level: z
 ```
 
+When `inspect` sees concrete opportunities, it prints ranked suggestions:
+
+```text
+suggestions:
+  1. Strip symbols from release binaries
+     confidence: medium
+     evidence: [profile.release].strip is not set.
+     tradeoff: Stripping symbols makes ad hoc debugging harder unless symbols are preserved separately.
+     action: Set [profile.release] strip = "symbols" or strip = true, then inspect the resulting binary.
+```
+
 For scripts and snapshot tests:
 
 ```sh
@@ -76,4 +87,4 @@ cargoslim inspect --json --limit 10 target/release/my-binary
 
 ## Status
 
-This repository is in the initial scaffold stage. The current implementation does not perform symbol, dependency, feature, or shrink-suggestion attribution yet.
+This repository is in the initial scaffold stage. The current implementation does not perform symbol or crate-level size attribution yet.
