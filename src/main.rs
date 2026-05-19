@@ -3,7 +3,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 
 use object::{Object, ObjectSection};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,29 @@ fn main() -> ExitCode {
             println!("cargoslim {VERSION}");
             ExitCode::SUCCESS
         }
+        Ok(Command::Attribution(options)) => match crate_attribution(&options) {
+            Ok(mut report) => {
+                report.apply_crate_limit(options.crate_limit);
+
+                if options.output == OutputFormat::Json {
+                    match serde_json::to_string_pretty(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(error) => {
+                            eprintln!("error: could not serialize report: {error}");
+                            return ExitCode::from(1);
+                        }
+                    }
+                } else {
+                    print_attribution_report(&report);
+                }
+
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        },
         Ok(Command::Diff(options)) => match diff_paths(&options.old_path, &options.new_path) {
             Ok(mut report) => {
                 report.apply_section_limit(options.section_limit);
@@ -81,8 +104,17 @@ fn main() -> ExitCode {
 enum Command {
     Help,
     Version,
+    Attribution(AttributionOptions),
     Diff(DiffOptions),
     Inspect(InspectOptions),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttributionOptions {
+    manifest_path: PathBuf,
+    binary_name: Option<String>,
+    output: OutputFormat,
+    crate_limit: Option<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -119,11 +151,75 @@ impl Command {
         match args.next().as_deref() {
             None | Some("-h") | Some("--help") => Ok(Self::Help),
             Some("-V") | Some("--version") => Ok(Self::Version),
+            Some("attribution") => parse_attribution(args),
             Some("diff") => parse_diff(args),
             Some("inspect") => parse_inspect(args),
             Some(command) => Err(format!("unknown command '{command}'")),
         }
     }
+}
+
+fn parse_attribution<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut output = OutputFormat::Text;
+    let mut crate_limit = Some(20);
+    let mut manifest_path = PathBuf::from("Cargo.toml");
+    let mut binary_name = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => output = OutputFormat::Json,
+            "--bin" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--bin requires a value".to_string())?;
+                binary_name = Some(value);
+            }
+            "--manifest-path" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--manifest-path requires a value".to_string())?;
+                manifest_path = PathBuf::from(value);
+            }
+            "--limit" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--limit requires a value".to_string())?;
+                crate_limit = Some(parse_section_limit(&value)?);
+            }
+            "-h" | "--help" => return Ok(Command::Help),
+            _ if arg.starts_with("--bin=") => {
+                let value = arg
+                    .strip_prefix("--bin=")
+                    .expect("argument should have --bin= prefix");
+                binary_name = Some(value.to_string());
+            }
+            _ if arg.starts_with("--limit=") => {
+                let value = arg
+                    .strip_prefix("--limit=")
+                    .expect("argument should have --limit= prefix");
+                crate_limit = Some(parse_section_limit(value)?);
+            }
+            _ if arg.starts_with("--manifest-path=") => {
+                let value = arg
+                    .strip_prefix("--manifest-path=")
+                    .expect("argument should have --manifest-path= prefix");
+                manifest_path = PathBuf::from(value);
+            }
+            _ if arg.starts_with('-') => return Err(format!("unknown attribution option '{arg}'")),
+            _ => return Err("attribution does not accept positional paths".to_string()),
+        }
+    }
+
+    Ok(Command::Attribution(AttributionOptions {
+        manifest_path,
+        binary_name,
+        output,
+        crate_limit,
+    }))
 }
 
 fn parse_diff<I>(args: I) -> Result<Command, String>
@@ -279,6 +375,39 @@ struct DiffReport {
     total_section_deltas: usize,
     section_deltas_omitted: usize,
     section_deltas: Vec<SectionDeltaReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct AttributionReport {
+    manifest_path: String,
+    package_root: String,
+    tool: String,
+    scope: String,
+    file_size_bytes: u64,
+    text_section_size_bytes: u64,
+    total_crates: usize,
+    crates_omitted: usize,
+    crates: Vec<CrateAttributionReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct CrateAttributionReport {
+    name: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct CargoBloatCrateOutput {
+    file_size: u64,
+    text_section_size: u64,
+    crates: Vec<CargoBloatCrate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoBloatCrate {
+    name: String,
+    size: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -449,6 +578,71 @@ fn diff_paths(old_path: &Path, new_path: &Path) -> Result<DiffReport, String> {
         total_section_deltas,
         section_deltas_omitted: 0,
         section_deltas,
+    })
+}
+
+fn crate_attribution(options: &AttributionOptions) -> Result<AttributionReport, String> {
+    let manifest_path = normalize_manifest_path(&options.manifest_path)?;
+    let package_root = manifest_path
+        .parent()
+        .ok_or_else(|| format!("'{}' has no parent directory", manifest_path.display()))?
+        .to_path_buf();
+    let cargo_bloat = env::var("CARGOSLIM_CARGO_BLOAT").unwrap_or_else(|_| "cargo".to_string());
+    let mut command = ProcessCommand::new(&cargo_bloat);
+
+    if cargo_bloat == "cargo" {
+        command.arg("bloat");
+    }
+
+    command
+        .current_dir(&package_root)
+        .arg("--release")
+        .arg("--crates")
+        .arg("--message-format")
+        .arg("json")
+        .arg("-n")
+        .arg("0");
+
+    if let Some(binary_name) = &options.binary_name {
+        command.arg("--bin").arg(binary_name);
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run cargo-bloat: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err("cargo-bloat failed without diagnostic output".to_string());
+        }
+        return Err(format!("cargo-bloat failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("cargo-bloat output was not utf-8: {error}"))?;
+    let parsed: CargoBloatCrateOutput = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("could not parse cargo-bloat JSON output: {error}"))?;
+    let crates = parsed
+        .crates
+        .into_iter()
+        .map(|krate| CrateAttributionReport {
+            name: krate.name,
+            size_bytes: krate.size,
+        })
+        .collect::<Vec<_>>();
+    let total_crates = crates.len();
+
+    Ok(AttributionReport {
+        manifest_path: manifest_path.display().to_string(),
+        package_root: package_root.display().to_string(),
+        tool: "cargo-bloat".to_string(),
+        scope: ".text section crate attribution from cargo-bloat --crates".to_string(),
+        file_size_bytes: parsed.file_size,
+        text_section_size_bytes: parsed.text_section_size,
+        total_crates,
+        crates_omitted: 0,
+        crates,
     })
 }
 
@@ -1018,6 +1212,21 @@ impl DiffReport {
     }
 }
 
+impl AttributionReport {
+    fn apply_crate_limit(&mut self, limit: Option<usize>) {
+        let Some(limit) = limit else {
+            return;
+        };
+
+        if self.crates.len() <= limit {
+            return;
+        }
+
+        self.crates_omitted = self.crates.len() - limit;
+        self.crates.truncate(limit);
+    }
+}
+
 fn diff_sections(
     old_object: Option<&ObjectReport>,
     new_object: Option<&ObjectReport>,
@@ -1167,6 +1376,37 @@ fn print_diff_report(report: &DiffReport) {
             "  ... {} more section deltas omitted",
             report.section_deltas_omitted
         );
+    }
+}
+
+fn print_attribution_report(report: &AttributionReport) {
+    println!("manifest: {}", report.manifest_path);
+    println!("package root: {}", report.package_root);
+    println!("tool: {}", report.tool);
+    println!("scope: {}", report.scope);
+    println!(
+        "file size: {} bytes ({:.2} MiB)",
+        report.file_size_bytes,
+        bytes_to_mib(report.file_size_bytes)
+    );
+    println!(
+        ".text size: {} bytes ({:.2} MiB)",
+        report.text_section_size_bytes,
+        bytes_to_mib(report.text_section_size_bytes)
+    );
+
+    if report.crates.is_empty() {
+        println!("crate attribution: none reported");
+        return;
+    }
+
+    println!("crate attribution:");
+    for krate in &report.crates {
+        println!("  {}: {} bytes", krate.name, krate.size_bytes);
+    }
+
+    if report.crates_omitted > 0 {
+        println!("  ... {} more crates omitted", report.crates_omitted);
     }
 }
 
@@ -1334,12 +1574,15 @@ fn print_help() {
 Explain Rust binary size and produce conservative shrink plans.
 
 Usage:
+  cargoslim attribution [--json] [--limit <n>] [--manifest-path <path>] [--bin <name>]
   cargoslim diff [--json] [--limit <n>] <old> <new>
   cargoslim inspect [--json] [--limit <n>] [--manifest-path <path>] <path>
   cargoslim --help
   cargoslim --version
 
 Commands:
+  attribution [--json] [--limit <n>] [--manifest-path <path>] [--bin <name>]
+    Report crate-level .text section attribution through cargo-bloat
   diff [--json] [--limit <n>] <old> <new>
     Compare file size and object section sizes between two binaries
   inspect [--json] [--limit <n>] [--manifest-path <path>] <path>
@@ -1350,7 +1593,8 @@ Commands:
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_delta, bytes_to_mib, inspect_path, Command, DiffOptions, InspectOptions, OutputFormat,
+        byte_delta, bytes_to_mib, inspect_path, AttributionOptions, Command, DiffOptions,
+        InspectOptions, OutputFormat,
     };
     use std::path::PathBuf;
 
@@ -1392,6 +1636,44 @@ mod tests {
                 new_path: PathBuf::from("new"),
                 output: OutputFormat::Text,
                 section_limit: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_attribution_defaults() {
+        let command = Command::parse(["attribution"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::Attribution(AttributionOptions {
+                manifest_path: PathBuf::from("Cargo.toml"),
+                binary_name: None,
+                output: OutputFormat::Text,
+                crate_limit: Some(20),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_attribution_options() {
+        let command = Command::parse([
+            "attribution",
+            "--json",
+            "--limit=4",
+            "--manifest-path",
+            "fixtures/Cargo.toml",
+            "--bin=cargoslim",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            command,
+            Command::Attribution(AttributionOptions {
+                manifest_path: PathBuf::from("fixtures/Cargo.toml"),
+                binary_name: Some("cargoslim".to_string()),
+                output: OutputFormat::Json,
+                crate_limit: Some(4),
             })
         );
     }

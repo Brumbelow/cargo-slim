@@ -14,9 +14,10 @@ This first version intentionally starts small:
 - `cargoslim inspect --json <path>` emits the report as JSON, using exact byte counts for sizes.
 - `cargoslim diff <old> <new>` compares file size and object section sizes between two binaries.
 - `cargoslim diff --json --limit <n> <old> <new>` emits exact byte deltas and the largest section deltas as JSON.
+- `cargoslim attribution --manifest-path Cargo.toml` reports crate-level `.text` section attribution through `cargo-bloat`.
 - `cargoslim --help` shows the available command surface.
 
-Current suggestions are intentionally narrow. They come from concrete release-profile settings, duplicate package versions in `Cargo.lock`, and direct dependency declarations where default-feature behavior is visible. Planned work includes binary attribution and deeper Cargo dependency and feature context. The goal is to explain size with evidence before suggesting changes.
+Current suggestions are intentionally narrow. They come from concrete release-profile settings, duplicate package versions in `Cargo.lock`, and direct dependency declarations where default-feature behavior is visible. Crate attribution currently uses `cargo-bloat --crates`, so it describes executable `.text` contribution rather than exact whole-file dependency cost. Planned work includes deeper Cargo dependency and feature context. The goal is to explain size with evidence before suggesting changes.
 
 ## Install from source
 
@@ -47,6 +48,14 @@ Compare two binaries:
 ```sh
 cargoslim diff target/release/my-binary.old target/release/my-binary
 ```
+
+Report crate-level `.text` attribution for a release build:
+
+```sh
+cargoslim attribution --manifest-path Cargo.toml --bin my-binary
+```
+
+This command requires `cargo-bloat` to be installed and available through Cargo.
 
 Example output:
 
@@ -92,8 +101,9 @@ For scripts and snapshot tests:
 ```sh
 cargoslim inspect --json --limit 10 target/release/my-binary
 cargoslim diff --json --limit 10 target/release/my-binary.old target/release/my-binary
+cargoslim attribution --json --limit 10 --manifest-path Cargo.toml --bin my-binary
 ```
 
 ## Status
 
-This repository is in the initial scaffold stage. The current implementation does not perform symbol or crate-level size attribution yet.
+This repository is in the initial scaffold stage. The current attribution path is intentionally scoped to crate-level `.text` section data reported by `cargo-bloat`.

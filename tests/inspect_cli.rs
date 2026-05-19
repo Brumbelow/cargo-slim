@@ -1,3 +1,7 @@
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 const NOT_OBJECT_FIXTURE: &str =
@@ -17,6 +21,25 @@ const SUGGESTIONS_MANIFEST: &str = concat!(
 
 fn cargoslim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cargoslim"))
+}
+
+#[cfg(unix)]
+fn fake_cargo_bloat() -> PathBuf {
+    let path =
+        std::env::temp_dir().join(format!("cargoslim-fake-cargo-bloat-{}", std::process::id()));
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+printf '%s\n' '{"file-size":5016528,"text-section-size":645811,"crates":[{"name":"std","size":363492},{"name":"toml","size":114256},{"name":"cargoslim","size":44079}]}'
+"#,
+    )
+    .expect("fake cargo-bloat script should be written");
+    let mut permissions = fs::metadata(&path)
+        .expect("fake cargo-bloat metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("fake cargo-bloat should be executable");
+    path
 }
 
 fn assert_inspect_error(args: &[&str], expected: &str) {
@@ -55,8 +78,74 @@ fn help_lists_inspect_command() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
     assert!(stdout.contains("cargoslim"));
+    assert!(stdout
+        .contains("attribution [--json] [--limit <n>] [--manifest-path <path>] [--bin <name>]"));
     assert!(stdout.contains("diff [--json] [--limit <n>] <old> <new>"));
     assert!(stdout.contains("inspect [--json] [--limit <n>] [--manifest-path <path>] <path>"));
+}
+
+#[cfg(unix)]
+#[test]
+fn attribution_reports_crate_text_from_cargo_bloat() {
+    let cargo_bloat = fake_cargo_bloat();
+    let output = cargoslim()
+        .env("CARGOSLIM_CARGO_BLOAT", cargo_bloat)
+        .args([
+            "attribution",
+            "--limit",
+            "2",
+            "--manifest-path",
+            CARGO_PROJECT_MANIFEST,
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("tool: cargo-bloat"));
+    assert!(stdout.contains("scope: .text section crate attribution from cargo-bloat --crates"));
+    assert!(stdout.contains("crate attribution:"));
+    assert!(stdout.contains("  std: 363492 bytes"));
+    assert!(stdout.contains("  toml: 114256 bytes"));
+    assert!(stdout.contains("  ... 1 more crates omitted"));
+    assert!(!stdout.contains("  cargoslim: 44079 bytes"));
+}
+
+#[cfg(unix)]
+#[test]
+fn attribution_reports_crate_json_from_cargo_bloat() {
+    let cargo_bloat = fake_cargo_bloat();
+    let output = cargoslim()
+        .env("CARGOSLIM_CARGO_BLOAT", cargo_bloat)
+        .args([
+            "attribution",
+            "--json",
+            "--limit=2",
+            "--manifest-path",
+            CARGO_PROJECT_MANIFEST,
+            "--bin",
+            "fixture-app",
+        ])
+        .output()
+        .expect("cargoslim should run");
+
+    assert!(output.status.success());
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid json");
+    assert_eq!(value["tool"], "cargo-bloat");
+    assert_eq!(
+        value["scope"],
+        ".text section crate attribution from cargo-bloat --crates"
+    );
+    assert_eq!(value["file_size_bytes"], 5_016_528);
+    assert_eq!(value["text_section_size_bytes"], 645_811);
+    assert_eq!(value["total_crates"], 3);
+    assert_eq!(value["crates_omitted"], 1);
+    assert_eq!(value["crates"].as_array().unwrap().len(), 2);
+    assert_eq!(value["crates"][0]["name"], "std");
+    assert_eq!(value["crates"][0]["size_bytes"], 363_492);
 }
 
 #[test]
@@ -415,6 +504,11 @@ fn diff_rejects_unknown_option() {
         &["diff", "--wat", NOT_OBJECT_FIXTURE, NOT_OBJECT_FIXTURE],
         "unknown diff option",
     );
+}
+
+#[test]
+fn attribution_rejects_unknown_option() {
+    assert_inspect_error(&["attribution", "--wat"], "unknown attribution option");
 }
 
 #[test]
